@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from abc import ABC
 from typing import AsyncIterable, Iterable, Literal
 
@@ -18,6 +19,7 @@ from api.models.base import BaseChatModel, BaseEmbeddingsModel
 from api.schema import (
     AssistantMessage,
     ChatRequest,
+    SystemMessage,
     ChatResponse,
     ChatResponseMessage,
     ChatStreamResponse,
@@ -46,6 +48,7 @@ from api.setting import (
     AWS_REGION,
     DEBUG,
     DEFAULT_MODEL,
+    ENABLE_BEDROCK_AGENTS,
     ENABLE_CROSS_REGION_INFERENCE,
     ENABLE_APPLICATION_INFERENCE_PROFILES,
     ENABLE_PROMPT_CACHING,
@@ -70,6 +73,16 @@ bedrock_runtime = boto3.client(
 )
 bedrock_client = boto3.client(
     service_name="bedrock",
+    region_name=AWS_REGION,
+    config=config,
+)
+bedrock_agent_runtime = boto3.client(
+    service_name="bedrock-agent-runtime",
+    region_name=AWS_REGION,
+    config=config,
+)
+bedrock_agent_client = boto3.client(
+    service_name="bedrock-agent",
     region_name=AWS_REGION,
     config=config,
 )
@@ -1273,6 +1286,271 @@ class BedrockModel(BaseChatModel):
                 finish_reason.lower(), finish_reason.lower()
             )
         return None
+
+
+class BedrockAgentModel(BaseChatModel):
+    """Chat model implementation that routes requests to Bedrock Agents.
+
+    Model ID format: bedrock-agent:<agentId>:<agentAliasId>
+
+    Session management (two strategies via extra_body):
+      Strategy A — Session-pinned (preferred): caller supplies extra_body.session_id.
+        Only the last user message is sent as inputText; the agent maintains history
+        server-side per session.
+      Strategy B — Stateless fallback: no session_id provided.
+        A new UUID session is generated per request and prior messages are passed as
+        sessionState.conversationHistory so the agent has full context.
+    """
+
+    def list_models(self) -> list[str]:
+        """Return all agents as bedrock-agent:<agentId>:<agentAliasId> model IDs."""
+        models = []
+        try:
+            paginator = bedrock_agent_client.get_paginator("list_agents")
+            for page in paginator.paginate():
+                for agent in page.get("agentSummaries", []):
+                    agent_id = agent["agentId"]
+                    try:
+                        aliases_resp = bedrock_agent_client.list_agent_aliases(agentId=agent_id)
+                        for alias in aliases_resp.get("agentAliasSummaries", []):
+                            models.append(f"bedrock-agent:{agent_id}:{alias['agentAliasId']}")
+                    except Exception as e:
+                        logger.warning("Could not list aliases for agent %s: %s", agent_id, str(e))
+        except Exception as e:
+            logger.error("Unable to list Bedrock Agents: %s", str(e))
+        return models
+
+    def validate(self, chat_request: ChatRequest):
+        parts = chat_request.model.split(":")
+        if len(parts) != 3:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Invalid agent model ID '{chat_request.model}'. "
+                    "Expected format: bedrock-agent:<agentId>:<agentAliasId>"
+                ),
+            )
+        user_messages = [m for m in chat_request.messages if isinstance(m, UserMessage)]
+        if not user_messages:
+            raise HTTPException(
+                status_code=400,
+                detail="At least one user message is required for Bedrock Agent invocation.",
+            )
+
+    def _parse_agent_id(self, model: str) -> tuple[str, str]:
+        _, agent_id, alias_id = model.split(":")
+        return agent_id, alias_id
+
+    def _get_input_text(self, chat_request: ChatRequest) -> str:
+        """Return the text of the last user message — this becomes the agent inputText."""
+        for message in reversed(chat_request.messages):
+            if isinstance(message, UserMessage):
+                if isinstance(message.content, str):
+                    return message.content
+                return "\n".join(
+                    part.text for part in message.content if isinstance(part, TextContent)
+                )
+        return ""
+
+    def _is_session_pinned(self, chat_request: ChatRequest) -> bool:
+        """True when the caller supplied an explicit session_id (Strategy A)."""
+        return bool(
+            chat_request.extra_body and chat_request.extra_body.get("session_id")
+        )
+
+    def _get_session_id(self, chat_request: ChatRequest) -> str:
+        """Return caller-supplied session_id, or generate a fresh UUID."""
+        if chat_request.extra_body:
+            session_id = chat_request.extra_body.get("session_id")
+            if session_id:
+                return str(session_id)
+        return str(uuid.uuid4())
+
+    def _build_conversation_history(self, chat_request: ChatRequest) -> list[dict]:
+        """Build a Bedrock conversationHistory from all messages except the last user message.
+
+        Used in stateless mode (Strategy B) so the agent has full context despite
+        receiving a freshly generated session ID on each request.
+        """
+        last_user_idx = -1
+        for i, msg in enumerate(chat_request.messages):
+            if isinstance(msg, UserMessage):
+                last_user_idx = i
+
+        history = []
+        for i, message in enumerate(chat_request.messages):
+            if isinstance(message, (SystemMessage, DeveloperMessage)):
+                continue
+            if i == last_user_idx:
+                continue  # Becomes inputText, not part of history
+            if isinstance(message, UserMessage):
+                content = (
+                    message.content
+                    if isinstance(message.content, str)
+                    else "\n".join(
+                        p.text for p in message.content if isinstance(p, TextContent)
+                    )
+                )
+                history.append({"role": "user", "content": [{"text": content}]})
+            elif isinstance(message, AssistantMessage):
+                if isinstance(message.content, str) and message.content:
+                    history.append({"role": "assistant", "content": [{"text": message.content}]})
+        return history
+
+    def _build_invoke_args(self, chat_request: ChatRequest) -> tuple[dict, str]:
+        """Assemble invoke_agent kwargs. Returns (args, session_id)."""
+        agent_id, alias_id = self._parse_agent_id(chat_request.model)
+        session_id = self._get_session_id(chat_request)
+        input_text = self._get_input_text(chat_request)
+        enable_trace = bool(
+            chat_request.extra_body and chat_request.extra_body.get("enable_trace", False)
+        )
+
+        args = {
+            "agentId": agent_id,
+            "agentAliasId": alias_id,
+            "sessionId": session_id,
+            "inputText": input_text,
+            "enableTrace": enable_trace,
+        }
+
+        # Strategy B: pass prior conversation as session state for stateless callers
+        if not self._is_session_pinned(chat_request):
+            history = self._build_conversation_history(chat_request)
+            if history:
+                args["sessionState"] = {"conversationHistory": {"messages": history}}
+
+        return args, session_id
+
+    async def chat(self, chat_request: ChatRequest) -> ChatResponse:
+        """Invoke a Bedrock Agent and return a complete non-streaming response."""
+        message_id = self.generate_message_id()
+        args, _session_id = self._build_invoke_args(chat_request)
+
+        if DEBUG:
+            safe_args = {k: v for k, v in args.items() if k != "sessionState"}
+            logger.info("Bedrock Agent request: %s", json.dumps(safe_args))
+
+        try:
+            response = await run_in_threadpool(bedrock_agent_runtime.invoke_agent, **args)
+        except Exception as e:
+            logger.error("Bedrock Agent invocation failed: %s", str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+        full_text = ""
+        for event in response.get("completion", []):
+            if "chunk" in event:
+                full_text += event["chunk"].get("bytes", b"").decode("utf-8")
+
+        output_tokens = len(ENCODER.encode(full_text))
+
+        chat_response = ChatResponse(
+            id=message_id,
+            model=chat_request.model,
+            choices=[
+                Choice(
+                    index=0,
+                    message=ChatResponseMessage(role="assistant", content=full_text),
+                    finish_reason="stop",
+                    logprobs=None,
+                )
+            ],
+            usage=Usage(
+                prompt_tokens=0,
+                completion_tokens=output_tokens,
+                total_tokens=output_tokens,
+            ),
+        )
+        chat_response.system_fingerprint = "fp"
+        chat_response.object = "chat.completion"
+        chat_response.created = int(time.time())
+        return chat_response
+
+    async def chat_stream(self, chat_request: ChatRequest) -> AsyncIterable[bytes]:
+        """Invoke a Bedrock Agent and stream the response as SSE chunks."""
+        message_id = self.generate_message_id()
+        args, _session_id = self._build_invoke_args(chat_request)
+
+        if DEBUG:
+            safe_args = {k: v for k, v in args.items() if k != "sessionState"}
+            logger.info("Bedrock Agent stream request: %s", json.dumps(safe_args))
+
+        try:
+            response = await run_in_threadpool(bedrock_agent_runtime.invoke_agent, **args)
+        except Exception as e:
+            logger.error("Bedrock Agent invocation failed: %s", str(e))
+            yield self.stream_response_to_bytes(Error(error=ErrorMessage(message=str(e))))
+            return
+
+        # Opening chunk — announce the assistant role
+        yield self.stream_response_to_bytes(
+            ChatStreamResponse(
+                id=message_id,
+                model=chat_request.model,
+                choices=[
+                    ChoiceDelta(
+                        index=0,
+                        delta=ChatResponseMessage(role="assistant", content=""),
+                        finish_reason=None,
+                    )
+                ],
+            )
+        )
+
+        full_text = ""
+        for event in response.get("completion", []):
+            if "chunk" not in event:
+                continue
+            text = event["chunk"].get("bytes", b"").decode("utf-8")
+            if not text:
+                continue
+            full_text += text
+            yield self.stream_response_to_bytes(
+                ChatStreamResponse(
+                    id=message_id,
+                    model=chat_request.model,
+                    choices=[
+                        ChoiceDelta(
+                            index=0,
+                            delta=ChatResponseMessage(content=text),
+                            finish_reason=None,
+                        )
+                    ],
+                )
+            )
+
+        # Final chunk with stop reason
+        yield self.stream_response_to_bytes(
+            ChatStreamResponse(
+                id=message_id,
+                model=chat_request.model,
+                choices=[
+                    ChoiceDelta(
+                        index=0,
+                        delta=ChatResponseMessage(),
+                        finish_reason="stop",
+                    )
+                ],
+            )
+        )
+
+        # Optional usage chunk
+        if chat_request.stream_options and chat_request.stream_options.include_usage:
+            output_tokens = len(ENCODER.encode(full_text))
+            yield self.stream_response_to_bytes(
+                ChatStreamResponse(
+                    id=message_id,
+                    model=chat_request.model,
+                    choices=[],
+                    usage=Usage(
+                        prompt_tokens=0,
+                        completion_tokens=output_tokens,
+                        total_tokens=output_tokens,
+                    ),
+                )
+            )
+
+        yield self.stream_response_to_bytes()  # [DONE]
 
 
 class BedrockEmbeddingsModel(BaseEmbeddingsModel, ABC):

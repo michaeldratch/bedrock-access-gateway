@@ -4,7 +4,7 @@ from fastapi import APIRouter, Body, Depends
 from fastapi.responses import StreamingResponse
 
 from api.auth import api_key_auth
-from api.models.bedrock import BedrockModel
+from api.models.bedrock import BedrockAgentModel, BedrockModel
 from api.schema import ChatRequest, ChatResponse, ChatStreamResponse, Error
 from api.setting import DEFAULT_MODEL
 
@@ -37,8 +37,12 @@ async def chat_completions(
     if chat_request.model.lower().startswith("gpt-"):
         chat_request.model = DEFAULT_MODEL
 
+    # Route to the appropriate model implementation.
     # Exception will be raised if model not supported.
-    model = BedrockModel()
+    if chat_request.model.startswith("bedrock-agent:"):
+        model = BedrockAgentModel()
+    else:
+        model = BedrockModel()
     model.validate(chat_request)
     if chat_request.stream:
         return StreamingResponse(content=model.chat_stream(chat_request), media_type="text/event-stream")
