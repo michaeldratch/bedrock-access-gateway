@@ -19,8 +19,13 @@ agent_model = BedrockAgentModel()
 
 def _all_model_ids() -> list[str]:
     ids = chat_model.list_models()
+    print("ENABLE_BEDROCK_AGENTS:")
+    print(ENABLE_BEDROCK_AGENTS)
     if ENABLE_BEDROCK_AGENTS:
-        ids = ids + agent_model.list_models()
+        print("in if block")
+        agent_models = agent_model.list_models()
+        print(len(agent_models))
+        ids = ids + agent_models
     return ids
 
 

@@ -6,8 +6,25 @@ services:
       context: ./src
       dockerfile: Dockerfile_ecs
     ports:
-      - "127.0.0.1:8000:8080"
+      - "8000:8080"
     env_file:
       - ./.env
     volumes:
-      - ${HOME}/.aws:/home/appuser/.aws
+      - C:/Users/Michael.Dratch/.aws:/home/appuser/.aws
+
+  open-webui:
+      image: ghcr.io/open-webui/open-webui:main
+      ports:
+        - "3000:8080"
+      volumes:
+        - open-webui:/app/backend/data
+      depends_on:
+        - bedrock-access-gateway
+      restart: always
+      environment:
+        - ENABLE_NOTES=false
+        - USER_PERMISSIONS_CHAT_CONTROLS=false
+        - ENABLE_FOLLOW_UP_GENERATION=false
+
+volumes:
+  open-webui:

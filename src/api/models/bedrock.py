@@ -1307,8 +1307,11 @@ class BedrockAgentModel(BaseChatModel):
         models = []
         try:
             paginator = bedrock_agent_client.get_paginator("list_agents")
+            print("paginator")
             for page in paginator.paginate():
+                print("page")
                 for agent in page.get("agentSummaries", []):
+                    print("agent")
                     agent_id = agent["agentId"]
                     try:
                         aliases_resp = bedrock_agent_client.list_agent_aliases(agentId=agent_id)
@@ -1397,7 +1400,7 @@ class BedrockAgentModel(BaseChatModel):
                     history.append({"role": "assistant", "content": [{"text": message.content}]})
         return history
 
-    def _build_invoke_args(self, chat_request: ChatRequest) -> tuple[dict, str]:
+    def _build_invoke_args(self, chat_request: ChatRequest, streaming: bool = False) -> tuple[dict, str]:
         """Assemble invoke_agent kwargs. Returns (args, session_id)."""
         agent_id, alias_id = self._parse_agent_id(chat_request.model)
         session_id = self._get_session_id(chat_request)
@@ -1414,6 +1417,9 @@ class BedrockAgentModel(BaseChatModel):
             "enableTrace": enable_trace,
         }
 
+        if streaming:
+            args["streamingConfigurations"] = {"streamFinalResponse": True}
+
         # Strategy B: pass prior conversation as session state for stateless callers
         if not self._is_session_pinned(chat_request):
             history = self._build_conversation_history(chat_request)
@@ -1425,7 +1431,7 @@ class BedrockAgentModel(BaseChatModel):
     async def chat(self, chat_request: ChatRequest) -> ChatResponse:
         """Invoke a Bedrock Agent and return a complete non-streaming response."""
         message_id = self.generate_message_id()
-        args, _session_id = self._build_invoke_args(chat_request)
+        args, _ = self._build_invoke_args(chat_request)
 
         if DEBUG:
             safe_args = {k: v for k, v in args.items() if k != "sessionState"}
@@ -1469,7 +1475,7 @@ class BedrockAgentModel(BaseChatModel):
     async def chat_stream(self, chat_request: ChatRequest) -> AsyncIterable[bytes]:
         """Invoke a Bedrock Agent and stream the response as SSE chunks."""
         message_id = self.generate_message_id()
-        args, _session_id = self._build_invoke_args(chat_request)
+        args, _ = self._build_invoke_args(chat_request, streaming=True)
 
         if DEBUG:
             safe_args = {k: v for k, v in args.items() if k != "sessionState"}
